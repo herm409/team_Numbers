@@ -2,11 +2,8 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 
 // Firebase Imports (v9 modular SDK)
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signOut, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, Timestamp, getDocs, writeBatch, setLogLevel } from 'firebase/firestore';
-
-// Recharts Imports for charting
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { getAuth, signInAnonymously, signOut, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, Timestamp, getDocs, writeBatch } from 'firebase/firestore';
 
 // --- Helper Components ---
 
@@ -42,15 +39,12 @@ const Modal = ({ isOpen, onClose, onConfirm, title, children }) => {
 const App = () => {
   // Core Data State
   const [associateData, setAssociateData] = useState([]);
-  const [organizationalHistory, setOrganizationalHistory] = useState([]);
-  const [associateHistory, setAssociateHistory] = useState([]);
 
   // UI State
   const [selectedAssociate, setSelectedAssociate] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [alertMessage, setAlertMessage] = useState('');
   const [fileName, setFileName] = useState('');
   const [showOnHoldList, setShowOnHoldList] = useState(false);
   const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
@@ -61,23 +55,34 @@ const App = () => {
   const [userId, setUserId] = useState(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
 
+  // --- Mappings ---
+  const levelMap = {
+    1: 'Associate',
+    2: 'Senior Associate',
+    3: 'Manager',
+    4: 'Senior Manager',
+    5: 'Director',
+    6: 'Senior Director',
+    7: 'Executive Director',
+    8: 'Bronze ED',
+    9: 'Silver ED',
+    10: 'Gold ED',
+    11: 'Platinum ED'
+  };
+
+  const getLevelTitle = (level) => levelMap[level] || `Level ${level}`;
+
   // --- Effects ---
 
   // Effect 1: Initialize Firebase and handle authentication
   useEffect(() => {
-    // This code reads the secure values from your .env file.
-    const firebaseConfig = {
-      apiKey: process.env.REACT_APP_FIREBASE_API_KEY,
-      authDomain: process.env.REACT_APP_FIREBASE_AUTH_DOMAIN,
-      projectId: process.env.REACT_APP_FIREBASE_PROJECT_ID,
-      storageBucket: process.env.REACT_APP_FIREBASE_STORAGE_BUCKET,
-      messagingSenderId: process.env.REACT_APP_FIREBASE_MESSAGING_SENDER_ID,
-      appId: process.env.REACT_APP_FIREBASE_APP_ID,
-      measurementId: process.env.REACT_APP_FIREBASE_MEASUREMENT_ID
-    };
+    // This logic is for the Canvas environment. For production, use environment variables.
+    const firebaseConfig = typeof __firebase_config !== 'undefined'
+      ? JSON.parse(__firebase_config)
+      : null;
 
-    if (!firebaseConfig.apiKey) {
-      setError("Firebase configuration is missing. Make sure you have set up your .env file correctly.");
+    if (!firebaseConfig) {
+      setError("Firebase configuration is missing. The app cannot be initialized.");
       setLoading(false);
       return;
     }
@@ -95,9 +100,13 @@ const App = () => {
           setUserId(user.uid);
           setIsAuthReady(true);
         } else {
-          // For production build, we rely only on anonymous sign-in.
+          const authToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
           try {
-            await signInAnonymously(authInstance);
+            if (authToken) {
+              await signInWithCustomToken(authInstance, authToken);
+            } else {
+              await signInAnonymously(authInstance);
+            }
           } catch (authError) {
             console.error("Firebase Authentication Error:", authError);
             setError("Authentication failed. Please refresh the page or check your connection.");
@@ -125,8 +134,7 @@ const App = () => {
     
     setLoading(true);
     
-    // Use a simple string for the appId in production.
-    const appId = 'production';
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
     const snapshotsColRef = collection(db, `artifacts/${appId}/users/${userId}/snapshots`);
     const q = query(snapshotsColRef, orderBy("uploadDate", "desc"));
 
@@ -146,31 +154,9 @@ const App = () => {
           setFileName('');
         }
 
-        const orgHistory = allSnapshots
-          .map(snap => {
-            const depthZero = snap.data.find(assoc => assoc['Depth Level'] === 0);
-            if (!depthZero) return null;
-
-            const premiumContributors = snap.data.filter(assoc => (assoc['Personal Premium MTD'] || 0) > 0).length;
-            const recruitsContributors = snap.data.filter(assoc => (assoc['Personal Recruits MTD'] || 0) > 0).length;
-
-            return {
-              date: snap.uploadDate instanceof Timestamp ? snap.uploadDate.toDate() : new Date(),
-              orgPremiumMTD: depthZero['Org Premium MTD'] || 0,
-              orgRecruitsMTD: depthZero['Org Recruits MTD'] || 0,
-              premiumContributors,
-              recruitsContributors,
-            };
-          })
-          .filter(Boolean)
-          .sort((a, b) => a.date - b.date);
-        
-        setOrganizationalHistory(orgHistory);
-
       } else {
         setAssociateData([]);
         setFileName('');
-        setOrganizationalHistory([]);
       }
       setLoading(false);
       setError(null);
@@ -183,79 +169,22 @@ const App = () => {
     return () => unsubscribe();
   }, [db, isAuthReady, userId]);
   
-  // Effect 3: Fetch historical data for a selected associate.
-  useEffect(() => {
-    if (!db || !userId || !selectedAssociate) {
-      setAssociateHistory([]);
-      return;
-    }
-
-    const fetchAssociateHistory = () => {
-        const appId = 'production';
-        const snapshotsColRef = collection(db, `artifacts/${appId}/users/${userId}/snapshots`);
-        const q = query(snapshotsColRef, orderBy("uploadDate", "asc"));
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const history = snapshot.docs.map(doc => {
-                const data = doc.data();
-                const foundAssoc = data.data.find(a => a['Associate ID'] === selectedAssociate['Associate ID']);
-                if (foundAssoc) {
-                    return {
-                        date: data.uploadDate instanceof Timestamp ? new Date(data.uploadDate.toDate()).toLocaleDateString() : 'N/A',
-                        personalPremium: foundAssoc['Personal Premium MTD'] || 0,
-                        orgPremium: foundAssoc['Org Premium MTD'] || 0,
-                        personalRecruits: foundAssoc['Personal Recruits MTD'] || 0,
-                        orgRecruits: foundAssoc['Org Recruits MTD'] || 0,
-                    };
-                }
-                return null;
-            }).filter(Boolean);
-            setAssociateHistory(history);
-        }, (err) => {
-            console.error("Error fetching associate history:", err);
-            setAlertMessage("Could not load historical data for the selected associate.");
-        });
-
-        return () => unsubscribe();
-    };
-
-    fetchAssociateHistory();
-  }, [db, userId, selectedAssociate]);
-
-
   // --- Memoized Calculations ---
 
   const organizationalSummary = useMemo(() => {
     const depthZeroAssociate = associateData.find(assoc => assoc['Depth Level'] === 0);
     if (!depthZeroAssociate) return null;
 
-    const currentOrgPremiumMTD = depthZeroAssociate['Org Premium MTD'] || 0;
-    const currentOrgRecruitsMTD = depthZeroAssociate['Org Recruits MTD'] || 0;
-    const currentOrgPremiumPMTD = depthZeroAssociate['Org Premium PMTD'] || 0;
-    const currentOrgRecruitsPMTD = depthZeroAssociate['Org Recruits PMTD'] || 0;
-
-    const currentPremiumContributors = associateData.filter(assoc => (assoc['Personal Premium MTD'] || 0) > 0).length;
-    const currentRecruitsContributors = associateData.filter(assoc => (assoc['Personal Recruits MTD'] || 0) > 0).length;
     const prevPremiumContributors = associateData.filter(assoc => (assoc['Personal Premium PMTD'] || 0) > 0).length;
     const prevRecruitsContributors = associateData.filter(assoc => (assoc['Personal Recruits PMTD'] || 0) > 0).length;
 
-    const getGrowth = (current, previous) => current > previous ? 'up' : (current < previous ? 'down' : 'flat');
-
     return {
-      orgPremiumMTD: currentOrgPremiumMTD,
-      orgPremiumPMTD: currentOrgPremiumPMTD,
-      orgPremiumYTD: depthZeroAssociate['Org Premium YTD'] || 0,
-      premiumGrowth: getGrowth(currentOrgPremiumMTD, currentOrgPremiumPMTD),
-      orgRecruitsMTD: currentOrgRecruitsMTD,
-      orgRecruitsPMTD: currentOrgRecruitsPMTD,
-      orgRecruitsYTD: depthZeroAssociate['Org Recruits YTD'] || 0,
-      recruitsGrowth: getGrowth(currentOrgRecruitsMTD, currentOrgRecruitsPMTD),
-      premiumContributorsMTD: currentPremiumContributors,
+      orgPremiumMTD: depthZeroAssociate['Org Premium MTD'] || 0,
+      orgPremiumPMTD: depthZeroAssociate['Org Premium PMTD'] || 0,
+      orgRecruitsMTD: depthZeroAssociate['Org Recruits MTD'] || 0,
+      orgRecruitsPMTD: depthZeroAssociate['Org Recruits PMTD'] || 0,
       premiumContributorsPMTD: prevPremiumContributors,
-      premiumContributorsGrowth: getGrowth(currentPremiumContributors, prevPremiumContributors),
-      recruitsContributorsMTD: currentRecruitsContributors,
       recruitsContributorsPMTD: prevRecruitsContributors,
-      recruitsContributorsGrowth: getGrowth(currentRecruitsContributors, prevRecruitsContributors),
     };
   }, [associateData]);
 
@@ -268,26 +197,18 @@ const App = () => {
     const personalPremiumMTD = depthZeroAssociate['Personal Premium MTD'] || 0;
 
     const result = {
-      sd: { qualified: false, threshold: sdThreshold, legLimit: sdLegLimit, totalCountablePremium: 0, legsOverLimit: [], needed: 0 },
-      ed: { qualified: false, threshold: edThreshold, legLimit: edLegLimit, totalCountablePremium: 0, legsOverLimit: [], needed: 0 },
+      sd: { qualified: false, threshold: sdThreshold, totalCountablePremium: 0, needed: 0 },
+      ed: { qualified: false, threshold: edThreshold, totalCountablePremium: 0, needed: 0 },
     };
 
     const effectiveSdLegPremium = depthOneAssociates.reduce((total, leg) => {
         const legPremium = leg['Org Premium MTD'] || 0;
-        if (legPremium > sdLegLimit) {
-            result.sd.legsOverLimit.push({ name: leg.Name, premium: legPremium });
-            return total + sdLegLimit;
-        }
-        return total + legPremium;
+        return total + Math.min(legPremium, sdLegLimit);
     }, 0);
 
     const effectiveEdLegPremium = depthOneAssociates.reduce((total, leg) => {
         const legPremium = leg['Org Premium MTD'] || 0;
-        if (legPremium > edLegLimit) {
-            result.ed.legsOverLimit.push({ name: leg.Name, premium: legPremium });
-            return total + edLegLimit;
-        }
-        return total + legPremium;
+        return total + Math.min(legPremium, edLegLimit);
     }, 0);
     
     result.sd.totalCountablePremium = effectiveSdLegPremium + personalPremiumMTD;
@@ -393,14 +314,12 @@ const App = () => {
 
         if (parsedData.length === 0) throw new Error("No valid data parsed from CSV.");
 
-        const appId = 'production';
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const snapshotsColRef = collection(db, `artifacts/${appId}/users/${userId}/snapshots`);
         await addDoc(snapshotsColRef, {
           uploadDate: serverTimestamp(), data: parsedData, originalFileName: file.name,
         });
         
-        setAlertMessage("File uploaded successfully!");
-
       } catch (err) {
         console.error("File processing/saving error:", err);
         setError(`Failed to process file. ${err.message || ''}`);
@@ -424,12 +343,11 @@ const App = () => {
     setLoading(true);
     setError(null);
     try {
-        const appId = 'production';
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const snapshotsColRef = collection(db, `artifacts/${appId}/users/${userId}/snapshots`);
         const snapshot = await getDocs(snapshotsColRef);
         
         if (snapshot.empty) {
-            setAlertMessage("No data to clear.");
             setLoading(false);
             return;
         }
@@ -443,10 +361,7 @@ const App = () => {
         setAssociateData([]);
         setSelectedAssociate(null);
         setFileName('');
-        setOrganizationalHistory([]);
-        setAssociateHistory([]);
         await signOut(auth);
-        setAlertMessage("All data has been cleared. Restarting session.");
 
     } catch (err) {
         console.error("Error clearing data:", err);
@@ -509,6 +424,9 @@ const App = () => {
                     className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
                     disabled={!isAuthReady || loading}
                   />
+                  <p className="mt-2 text-xs text-gray-500">
+                    Report to upload: <a href="https://legalshield.myvoffice.com/index.cfm?Fuseaction=evo_Modules.QueryReport&QryID=Counters&QueryType=Counters&tabsel=Personal_Active_Enrollments" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Premium & Recruiting Activity: Organization</a>
+                  </p>
                   {fileName && <p className="mt-2 text-sm text-gray-600">Last Loaded: <span className="font-medium">{fileName}</span></p>}
                   {loading && <p className="mt-2 text-blue-500">Processing...</p>}
                   {error && <p className="mt-2 text-red-600 font-medium">{error}</p>}
@@ -633,7 +551,7 @@ const App = () => {
                             onClick={() => handleSelectAssociate(associate)}
                           >
                             <p className="font-medium text-gray-800 text-sm">{associate.Name}</p>
-                            <p className="text-xs text-gray-500">ID: {associate['Associate ID']} | Level: {associate.Level}</p>
+                            <p className="text-xs text-gray-500">ID: {associate['Associate ID']} | Rank: {getLevelTitle(associate.Level)}</p>
                           </div>
                         ))
                       ) : (
@@ -649,27 +567,23 @@ const App = () => {
                             <p className="text-md text-gray-600 mb-4">ID: {selectedAssociate['Associate ID']}</p>
                             
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                                <div className="bg-gray-50 p-4 rounded-lg shadow-sm">
+                                  <p className="text-gray-800"><span className="font-semibold">Rank:</span> {getLevelTitle(selectedAssociate.Level)}</p>
+                                  <p className="text-gray-800"><span className="font-semibold">Depth Level:</span> {selectedAssociate['Depth Level']}</p>
+                                </div>
                                 <div className="bg-blue-50 p-4 rounded-lg">
                                     <h4 className="text-lg font-medium text-blue-700">Personal Premium</h4>
                                     <p className="text-gray-800"><span className="font-semibold">MTD:</span> ${selectedAssociate['Personal Premium MTD']?.toFixed(2) || '0.00'}</p>
+                                    <p className="text-gray-800"><span className="font-semibold">PMTD:</span> ${selectedAssociate['Personal Premium PMTD']?.toFixed(2) || '0.00'}</p>
                                     <p className="text-gray-800"><span className="font-semibold">YTD:</span> ${selectedAssociate['Personal Premium YTD']?.toFixed(2) || '0.00'}</p>
                                 </div>
                                 <div className="bg-yellow-50 p-4 rounded-lg">
                                     <h4 className="text-lg font-medium text-yellow-700">Personal Recruits</h4>
                                     <p className="text-gray-800"><span className="font-semibold">MTD:</span> {selectedAssociate['Personal Recruits MTD'] || 0}</p>
+                                    <p className="text-gray-800"><span className="font-semibold">PMTD:</span> {selectedAssociate['Personal Recruits PMTD'] || 0}</p>
                                     <p className="text-gray-800"><span className="font-semibold">YTD:</span> {selectedAssociate['Personal Recruits YTD'] || 0}</p>
                                 </div>
                             </div>
-
-                            {associateHistory.length > 1 ? (
-                                <div className="mb-6">
-                                    <h3 className="text-xl font-semibold text-gray-700 mb-2">Historical MTD Performance</h3>
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-64">
-                                        <ResponsiveContainer width="100%" height="100%"><LineChart data={associateHistory} margin={{ top: 5, right: 20, left: -10, bottom: 5 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="date" fontSize={10} /><YAxis fontSize={10} /><Tooltip /><Legend /><Line type="monotone" dataKey="personalPremium" name="Personal" stroke="#3b82f6" /><Line type="monotone" dataKey="orgPremium" name="Org" stroke="#8b5cf6" /></LineChart></ResponsiveContainer>
-                                        <ResponsiveContainer width="100%" height="100%"><LineChart data={associateHistory} margin={{ top: 5, right: 20, left: -10, bottom: 5 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="date" fontSize={10} /><YAxis fontSize={10} /><Tooltip /><Legend /><Line type="monotone" dataKey="personalRecruits" name="Personal" stroke="#f59e0b" /><Line type="monotone" dataKey="orgRecruits" name="Org" stroke="#ec4899" /></LineChart></ResponsiveContainer>
-                                    </div>
-                                </div>
-                            ) : <p className="text-gray-500 text-sm mb-4">Not enough historical data for charts.</p>}
 
                         </div>
                     ) : (
